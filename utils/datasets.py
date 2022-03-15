@@ -33,8 +33,8 @@ from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
 HELP_URL = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
-IMG_FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp'  # include image suffixes
-VID_FORMATS = 'asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'wmv'  # include video suffixes
+IMG_FORMATS = ['bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp']  # include image suffixes
+VID_FORMATS = ['asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'wmv']  # include video suffixes
 
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
@@ -216,7 +216,8 @@ class LoadImages:
         else:
             # Read image
             self.count += 1
-            img0 = cv2.imread(path)  # BGR
+            #img0 = cv2.imread(path)  # BGR
+            img0 = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR)
             assert img0 is not None, f'Image Not Found {path}'
             s = f'image {self.count}/{self.nf} {path}: '
 
@@ -407,19 +408,19 @@ class LoadImagesAndLabels(Dataset):
                         # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
                 else:
                     raise Exception(f'{prefix}{p} does not exist')
-            self.im_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
+            self.img_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
             # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
-            assert self.im_files, f'{prefix}No images found'
+            assert self.img_files, f'{prefix}No images found'
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {HELP_URL}')
 
         # Check cache
-        self.label_files = img2label_paths(self.im_files)  # labels
+        self.label_files = img2label_paths(self.img_files)  # labels
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
         try:
             cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
             assert cache['version'] == self.cache_version  # same version
-            assert cache['hash'] == get_hash(self.label_files + self.im_files)  # same hash
+            assert cache['hash'] == get_hash(self.label_files + self.img_files)  # same hash
         except Exception:
             cache, exists = self.cache_labels(cache_path, prefix), False  # cache
 
@@ -437,7 +438,7 @@ class LoadImagesAndLabels(Dataset):
         labels, shapes, self.segments = zip(*cache.values())
         self.labels = list(labels)
         self.shapes = np.array(shapes, dtype=np.float64)
-        self.im_files = list(cache.keys())  # update
+        self.img_files = list(cache.keys())  # update
         self.label_files = img2label_paths(cache.keys())  # update
         n = len(shapes)  # number of images
         bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
@@ -466,7 +467,7 @@ class LoadImagesAndLabels(Dataset):
             s = self.shapes  # wh
             ar = s[:, 1] / s[:, 0]  # aspect ratio
             irect = ar.argsort()
-            self.im_files = [self.im_files[i] for i in irect]
+            self.img_files = [self.img_files[i] for i in irect]
             self.label_files = [self.label_files[i] for i in irect]
             self.labels = [self.labels[i] for i in irect]
             self.shapes = s[irect]  # wh
@@ -485,20 +486,24 @@ class LoadImagesAndLabels(Dataset):
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
 
         # Cache images into RAM/disk for faster training (WARNING: large datasets may exceed system resources)
-        self.ims = [None] * n
-        self.npy_files = [Path(f).with_suffix('.npy') for f in self.im_files]
+        self.imgs, self.img_npy = [None] * n, [None] * n
         if cache_images:
+            if cache_images == 'disk':
+                self.im_cache_dir = Path(Path(self.img_files[0]).parent.as_posix() + '_npy')
+                self.img_npy = [self.im_cache_dir / Path(f).with_suffix('.npy').name for f in self.img_files]
+                self.im_cache_dir.mkdir(parents=True, exist_ok=True)
             gb = 0  # Gigabytes of cached images
-            self.im_hw0, self.im_hw = [None] * n, [None] * n
-            fcn = self.cache_images_to_disk if cache_images == 'disk' else self.load_image
-            results = ThreadPool(NUM_THREADS).imap(fcn, range(n))
+            self.img_hw0, self.img_hw = [None] * n, [None] * n
+            results = ThreadPool(NUM_THREADS).imap(self.load_image, range(n))
             pbar = tqdm(enumerate(results), total=n)
             for i, x in pbar:
                 if cache_images == 'disk':
-                    gb += self.npy_files[i].stat().st_size
+                    if not self.img_npy[i].exists():
+                        np.save(self.img_npy[i].as_posix(), x[0])
+                    gb += self.img_npy[i].stat().st_size
                 else:  # 'ram'
-                    self.ims[i], self.im_hw0[i], self.im_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
-                    gb += self.ims[i].nbytes
+                    self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
+                    gb += self.imgs[i].nbytes
                 pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB {cache_images})'
             pbar.close()
 
@@ -508,8 +513,8 @@ class LoadImagesAndLabels(Dataset):
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
         desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels..."
         with Pool(NUM_THREADS) as pool:
-            pbar = tqdm(pool.imap(verify_image_label, zip(self.im_files, self.label_files, repeat(prefix))),
-                        desc=desc, total=len(self.im_files))
+            pbar = tqdm(pool.imap(verify_image_label, zip(self.img_files, self.label_files, repeat(prefix))),
+                        desc=desc, total=len(self.img_files))
             for im_file, lb, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
                 nm += nm_f
                 nf += nf_f
@@ -526,8 +531,8 @@ class LoadImagesAndLabels(Dataset):
             LOGGER.info('\n'.join(msgs))
         if nf == 0:
             LOGGER.warning(f'{prefix}WARNING: No labels found in {path}. See {HELP_URL}')
-        x['hash'] = get_hash(self.label_files + self.im_files)
-        x['results'] = nf, nm, ne, nc, len(self.im_files)
+        x['hash'] = get_hash(self.label_files + self.img_files)
+        x['results'] = nf, nm, ne, nc, len(self.img_files)
         x['msgs'] = msgs  # warnings
         x['version'] = self.cache_version  # cache version
         try:
@@ -539,7 +544,7 @@ class LoadImagesAndLabels(Dataset):
         return x
 
     def __len__(self):
-        return len(self.im_files)
+        return len(self.img_files)
 
     # def __iter__(self):
     #     self.count = -1
@@ -618,16 +623,19 @@ class LoadImagesAndLabels(Dataset):
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
-        return torch.from_numpy(img), labels_out, self.im_files[index], shapes
+        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
 
     def load_image(self, i):
-        # Loads 1 image from dataset index 'i', returns (im, original hw, resized hw)
-        im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i],
+        # loads 1 image from dataset index 'i', returns (im, original hw, resized hw)
+        im = self.imgs[i]
         if im is None:  # not cached in RAM
-            if fn.exists():  # load npy
-                im = np.load(fn)
+            npy = self.img_npy[i]
+            if npy and npy.exists():  # load npy
+                im = np.load(npy)
             else:  # read image
-                im = cv2.imread(f)  # BGR
+                f = self.img_files[i]
+                #im = cv2.imread(f)  # BGR
+                im = cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR)
                 assert im is not None, f'Image Not Found {f}'
             h0, w0 = im.shape[:2]  # orig hw
             r = self.img_size / max(h0, w0)  # ratio
@@ -637,13 +645,7 @@ class LoadImagesAndLabels(Dataset):
                                 interpolation=cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA)
             return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
         else:
-            return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
-
-    def cache_images_to_disk(self, i):
-        # Saves an image as an *.npy file for faster loading
-        f = self.npy_files[i]
-        if not f.exists():
-            np.save(f.as_posix(), cv2.imread(self.im_files[i]))
+            return self.imgs[i], self.img_hw0[i], self.img_hw[i]  # im, hw_original, hw_resized
 
     def load_mosaic(self, index):
         # YOLOv5 4-mosaic loader. Loads 1 image + 3 random images into a 4-image mosaic
@@ -777,16 +779,16 @@ class LoadImagesAndLabels(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        im, label, path, shapes = zip(*batch)  # transposed
+        img, label, path, shapes = zip(*batch)  # transposed
         for i, lb in enumerate(label):
             lb[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(im, 0), torch.cat(label, 0), path, shapes
+        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
 
     @staticmethod
     def collate_fn4(batch):
         img, label, path, shapes = zip(*batch)  # transposed
         n = len(shapes) // 4
-        im4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
+        img4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
 
         ho = torch.tensor([[0.0, 0, 0, 1, 0, 0]])
         wo = torch.tensor([[0.0, 0, 1, 0, 0, 0]])
@@ -800,13 +802,13 @@ class LoadImagesAndLabels(Dataset):
             else:
                 im = torch.cat((torch.cat((img[i], img[i + 1]), 1), torch.cat((img[i + 2], img[i + 3]), 1)), 2)
                 lb = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
-            im4.append(im)
+            img4.append(im)
             label4.append(lb)
 
         for i, lb in enumerate(label4):
             lb[:, 0] = i  # add target image index for build_targets()
 
-        return torch.stack(im4, 0), torch.cat(label4, 0), path4, shapes4
+        return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
@@ -834,7 +836,8 @@ def extract_boxes(path=DATASETS_DIR / 'coco128'):  # from utils.datasets import 
     for im_file in tqdm(files, total=n):
         if im_file.suffix[1:] in IMG_FORMATS:
             # image
-            im = cv2.imread(str(im_file))[..., ::-1]  # BGR to RGB
+            #im = cv2.imread(str(im_file))[..., ::-1]  # BGR to RGB
+            im = cv2.imdecode(np.fromfile(im_file, np.uint8), cv2.IMREAD_COLOR)[..., ::-1]
             h, w = im.shape[:2]
 
             # labels
@@ -906,7 +909,7 @@ def verify_image_label(args):
             nf = 1  # label found
             with open(lb_file) as f:
                 lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
-                if any(len(x) > 6 for x in lb):  # is segment
+                if any([len(x) > 8 for x in lb]):  # is segment
                     classes = np.array([x[0] for x in lb], dtype=np.float32)
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
@@ -971,7 +974,8 @@ def dataset_stats(path='coco128.yaml', autodownload=False, verbose=False, profil
             im.save(f_new, 'JPEG', quality=75, optimize=True)  # save
         except Exception as e:  # use OpenCV
             print(f'WARNING: HUB ops PIL failure {f}: {e}')
-            im = cv2.imread(f)
+            #im = cv2.imread(f)
+            im = cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR)
             im_height, im_width = im.shape[:2]
             r = max_dim / max(im_height, im_width)  # ratio
             if r < 1.0:  # image too large
@@ -999,12 +1003,12 @@ def dataset_stats(path='coco128.yaml', autodownload=False, verbose=False, profil
                         'image_stats': {'total': dataset.n, 'unlabelled': int(np.all(x == 0, 1).sum()),
                                         'per_class': (x > 0).sum(0).tolist()},
                         'labels': [{str(Path(k).name): round_labels(v.tolist())} for k, v in
-                                   zip(dataset.im_files, dataset.labels)]}
+                                   zip(dataset.img_files, dataset.labels)]}
 
         if hub:
             im_dir = hub_dir / 'images'
             im_dir.mkdir(parents=True, exist_ok=True)
-            for _ in tqdm(ThreadPool(NUM_THREADS).imap(hub_ops, dataset.im_files), total=dataset.n, desc='HUB Ops'):
+            for _ in tqdm(ThreadPool(NUM_THREADS).imap(hub_ops, dataset.img_files), total=dataset.n, desc='HUB Ops'):
                 pass
 
     # Profile
